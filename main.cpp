@@ -6,9 +6,54 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include "iomanip"
+#include <cstdint>
+#include <vector>
+
+#include <SDL2/SDL.h>
+
+enum NALUnitType {
+    TRAIL_N = 1, TRAIL_R = 0, IDR_W_RADL = 19, IDR_N_LP = 20, CRA_NUT = 21
+};
+
+enum SliceType { P_SLICE = 0, B_SLICE = 1, I_SLICE = 2 };
+
+// 模拟从比特流中读取 Exp-Golomb 编码
+uint32_t readExpGolomb(uint8_t* data, size_t& bitOffset) {
+    uint32_t leadingZeros = 0;
+    while ((data[bitOffset / 8] & (1 << (7 - (bitOffset % 8)))) == 0) {
+        leadingZeros++;
+        bitOffset++;
+    }
+    bitOffset++; // 跳过终止位 '1'
+    uint32_t value = (1 << leadingZeros) - 1;
+    for (uint32_t i = 0; i < leadingZeros; i++) {
+        value |= ((data[bitOffset / 8] >> (7 - (bitOffset % 8))) & 1) << (leadingZeros - 1 - i);
+        bitOffset++;
+    }
+    return value;
+}
+
+// 解析 Slice Header 中的 slice_type
+uint8_t parseSliceType(uint8_t* nalUnit) {
+    size_t bitOffset = 16; // 跳过 2 字节 NAL 头
+    // 1. 跳过 first_slice_segment_in_pic_flag（1 bit）
+    bitOffset++;
+    // 2. 跳过 slice_pic_parameter_set_id（Exp-Golomb）
+    readExpGolomb(nalUnit, bitOffset);
+    // 3. 读取 slice_type（Exp-Golomb）
+    return readExpGolomb(nalUnit, bitOffset); // 返回值 0=P, 1=B, 2=I
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <input_file.h265>\n";
+        return -1;
+    }
+
+    // 初始化SDL
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER)) {
+        printf("Could not initialize SDL - %s\n", SDL_GetError());
         return -1;
     }
 
@@ -52,33 +97,71 @@ int main(int argc, char** argv) {
     }
 
     // 创建解码器上下文
-    AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
-    if (avcodec_parameters_to_context(codec_ctx, codec_params) < 0) {
+    AVCodecContext* pCodecCtx = avcodec_alloc_context3(codec);
+    if (avcodec_parameters_to_context(pCodecCtx, codec_params) < 0) {
         std::cerr << "Could not copy codec parameters to context\n";
         return -1;
     }
 
     // 打开解码器
-    if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
+    if (avcodec_open2(pCodecCtx, codec, nullptr) < 0) {
         std::cerr << "Could not open codec\n";
         return -1;
     }
 
+    // 创建SDL窗口
+    SDL_Window *screen = SDL_CreateWindow("H.265 Player",
+                                          SDL_WINDOWPOS_UNDEFINED,
+                                          SDL_WINDOWPOS_UNDEFINED,
+                                          pCodecCtx->width,
+                                          pCodecCtx->height,
+                                          SDL_WINDOW_RESIZABLE);
+
+    SDL_Renderer *renderer = SDL_CreateRenderer(screen, -1, 0);
+    SDL_Texture *texture = SDL_CreateTexture(renderer,
+                                             SDL_PIXELFORMAT_YV12,
+                                             SDL_TEXTUREACCESS_STREAMING,
+                                             pCodecCtx->width,
+                                             pCodecCtx->height);
+
     // 分配帧结构
-    AVFrame* frame = av_frame_alloc();
+    AVFrame* pFrameYUV = av_frame_alloc();
     AVPacket* packet = av_packet_alloc();
 
     // 创建SWS上下文用于颜色空间转换
     SwsContext* sws_ctx = sws_getContext(
-            codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
-            codec_ctx->width, codec_ctx->height, AV_PIX_FMT_RGB24,
+            pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt,
+            pCodecCtx->width, pCodecCtx->height, AV_PIX_FMT_RGB24,
             SWS_BILINEAR, nullptr, nullptr, nullptr);
 
+
+    SDL_Event event;
     // 读取并解码帧
     while (av_read_frame(format_ctx, packet) >= 0) {
         if (packet->stream_index == video_stream_index) {
+            std::cout<<"===>"
+                         <<static_cast<int>(packet->data[0])
+                    <<"_"<<static_cast<int>(packet->data[1])
+                    <<"_"<<static_cast<int>(packet->data[2])
+                    <<"_"<<static_cast<int>(packet->data[3])
+                    <<"_"<<static_cast<int>(packet->data[4])
+                    <<"_"<<static_cast<int>(packet->data[5])
+                    <<"_"<<static_cast<int>(packet->data[6])
+                    <<"_"<<static_cast<int>(packet->data[7])
+                    <<"_"<<static_cast<int>(packet->data[8])
+                    <<"_"<<static_cast<int>(packet->data[9])
+                    <<std::endl;
+            uint8_t nal_type = (packet->data[4] >> 1) & 0x3F;
+            // 如果是切片数据，解析slice_type
+            if (nal_type == TRAIL_N || nal_type == TRAIL_R ||
+                nal_type == IDR_W_RADL || nal_type == IDR_N_LP) {
+                uint8_t sliceType=parseSliceType((packet->data+4));
+                std::cout<<"===>帧类型:(0=P, 1=B, 2=I) -> "<<static_cast<int>(sliceType)<<std::endl;
+
+            }
+
             // 发送数据包给解码器
-            int ret = avcodec_send_packet(codec_ctx, packet);
+            int ret = avcodec_send_packet(pCodecCtx, packet);
             if (ret < 0) {
                 std::cerr << "Error sending packet for decoding\n";
                 continue;
@@ -86,7 +169,7 @@ int main(int argc, char** argv) {
 
             // 接收解码后的帧
             while (ret >= 0) {
-                ret = avcodec_receive_frame(codec_ctx, frame);
+                ret = avcodec_receive_frame(pCodecCtx, pFrameYUV);
                 if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
                     break;
                 } else if (ret < 0) {
@@ -94,31 +177,65 @@ int main(int argc, char** argv) {
                     break;
                 }
 
+                switch (static_cast<int>(pFrameYUV->pict_type)) {
+                    case 1:
+                        std::cout<<"===>AV_PICTURE_TYPE_I : "<<AV_PICTURE_TYPE_I;
+                        break;
+                    case 2:
+                        std::cout<<"===>AV_PICTURE_TYPE_P : "<<AV_PICTURE_TYPE_P;
+                        break;
+                    case 3:
+                        std::cout<<"===>AV_PICTURE_TYPE_B : "<<AV_PICTURE_TYPE_B;
+                        break;
+                }
                 // 这里可以处理解码后的帧数据
-                std::cout << "Decoded frame " << frame->pts << " ("
-                          << frame->width << "x" << frame->height << ")\n";
+                std::cout << "Decoded frame " << pFrameYUV->pts << " ("
+                          << pFrameYUV->width << "x" << pFrameYUV->height << ")\n";
 
                 // 转换为RGB格式示例
-                uint8_t* rgb_data[1] = { new uint8_t[frame->width * frame->height * 3] };
-                int rgb_linesize[1] = { frame->width * 3 };
+                uint8_t* rgb_data[1] = { new uint8_t[pFrameYUV->width * pFrameYUV->height * 3] };
+                int rgb_linesize[1] = { pFrameYUV->width * 3 };
 
-                sws_scale(sws_ctx, frame->data, frame->linesize, 0,
-                          frame->height, rgb_data, rgb_linesize);
+                sws_scale(sws_ctx, pFrameYUV->data, pFrameYUV->linesize, 0,
+                          pFrameYUV->height, rgb_data, rgb_linesize);
 
                 // 使用rgb_data...
+                // 更新SDL纹理
+                SDL_UpdateYUVTexture(texture, NULL,
+                                     pFrameYUV->data[0], pFrameYUV->linesize[0],
+                                     pFrameYUV->data[1], pFrameYUV->linesize[1],
+                                     pFrameYUV->data[2], pFrameYUV->linesize[2]);
+
+                SDL_RenderClear(renderer);
+                SDL_RenderCopy(renderer, texture, NULL, NULL);
+                SDL_RenderPresent(renderer);
+
+                // 控制帧率
+                SDL_Delay(40); // 约25fps
 
                 delete[] rgb_data[0];
             }
         }
         av_packet_unref(packet);
+
+        // 处理事件
+        SDL_PollEvent(&event);
+        switch (event.type) {
+            case SDL_QUIT:
+                goto end;
+            default:
+                break;
+        }
     }
 
+end:
     // 清理资源
-    av_frame_free(&frame);
+    av_frame_free(&pFrameYUV);
     av_packet_free(&packet);
-    avcodec_free_context(&codec_ctx);
+    avcodec_free_context(&pCodecCtx);
     avformat_close_input(&format_ctx);
     sws_freeContext(sws_ctx);
+    SDL_Quit();
 
     return 0;
 }
