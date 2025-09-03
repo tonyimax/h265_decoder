@@ -210,8 +210,8 @@ int main(int argc, char** argv) {
                 SDL_RenderCopy(renderer, texture, NULL, NULL);
                 SDL_RenderPresent(renderer);
 
-                // 控制帧率
-                SDL_Delay(40); // 约25fps
+                // 控制帧率 for local 265 file open it
+                //SDL_Delay(40); // 约25fps
 
                 delete[] rgb_data[0];
             }

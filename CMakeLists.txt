@@ -3,7 +3,17 @@ set(PROJ_NAME h265_decoder)
 project(${PROJ_NAME})
 
 set(CMAKE_CXX_STANDARD 20)
-
+#  Apple Silicon
+if (APPLE)
+    include_directories(
+            /opt/homebrew/Cellar/ffmpeg/8.0/include
+            /opt/homebrew/include
+    )
+    link_directories(
+            /opt/homebrew/Cellar/ffmpeg/8.0/lib
+            /opt/homebrew/lib
+    )
+endif ()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(AVCODEC REQUIRED libavcodec)
 pkg_check_modules(AVFORMAT REQUIRED libavformat)
